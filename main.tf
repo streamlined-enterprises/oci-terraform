@@ -2,6 +2,22 @@ locals {
   setup_script_hash = filesha256("${path.module}/setup.sh")
 }
 
+terraform {
+  required_providers {
+    oci = {
+      source = "oracle/oci"
+    }
+    cloudflare = {
+      source  = "cloudflare/cloudflare"
+      version = "~> 4.0"
+    }
+  }
+}
+
+provider "cloudflare" {
+  api_token = var.cloudflare_api_token
+}
+
 # Reserve a Public IP Address
 resource "oci_core_public_ip" "reserved_ip" {
   compartment_id = var.compartment_ocid
@@ -28,8 +44,9 @@ resource "oci_core_instance" "always_free_vm" {
     type        = "ssh"
     user        = "opc"
     private_key = file("/home/ty/.ssh/ssh.key")
-    host        = oci_core_public_ip.reserved_ip.ip_address
+    host        = self.public_ip_address
     timeout     = "10m"
+    agent       = false
   }
 
   # Copy setup.sh to the remote VM
@@ -39,17 +56,17 @@ resource "oci_core_instance" "always_free_vm" {
   }
 
   # Execute the script on the remote VM
-  #provisioner "remote-exec" {
-    #inline = [
-      #"chmod +x /tmp/setup.sh",
-      #"sudo bash /tmp/setup.sh"
-    #]
-  #}
+  provisioner "remote-exec" {
+    inline = [
+      "chmod +x /tmp/setup.sh",
+      "sudo bash /tmp/setup.sh"
+    ]
+  }
 
   create_vnic_details {
     subnet_id              = oci_core_subnet.public_subnet.id
     display_name           = "Primary VNIC"
-    assign_public_ip       = false
+    assign_public_ip       = true
     private_ip             = "10.0.1.10"
     skip_source_dest_check = false
     nsg_ids                = [oci_core_network_security_group.free_nsg.id]
@@ -157,7 +174,7 @@ resource "oci_core_network_security_group_security_rule" "ssh_in" {
   }
 }
 
-# Allow HTTP Ingress
+# Allow HTTP Ingress (for Cloudflare tunnel validation)
 resource "oci_core_network_security_group_security_rule" "http_in" {
   network_security_group_id = oci_core_network_security_group.free_nsg.id
   direction                 = "INGRESS"
@@ -174,7 +191,7 @@ resource "oci_core_network_security_group_security_rule" "http_in" {
   }
 }
 
-# Allow HTTPS Ingress
+# Allow HTTPS Ingress (for Cloudflare tunnel validation)
 resource "oci_core_network_security_group_security_rule" "https_in" {
   network_security_group_id = oci_core_network_security_group.free_nsg.id
   direction                 = "INGRESS"
@@ -201,6 +218,8 @@ resource "oci_core_network_security_group_security_rule" "egress" {
   stateless                 = false
 }
 
+# NOTE: Port 3000 is NOT exposed globally. Only cloudflared will access it via localhost.
+
 # Data source to get the Oracle Linux image
 data "oci_core_images" "oracle_linux" {
   compartment_id           = var.compartment_ocid
@@ -216,3 +235,85 @@ data "oci_identity_availability_domains" "ads" {
   compartment_id = var.tenancy_ocid
 }
 
+# ==================== CLOUDFLARE ZERO TRUST ====================
+
+# Create Cloudflare Tunnel
+resource "cloudflare_tunnel" "openhands" {
+  account_id = var.cloudflare_account_id
+  name       = "openhands-tunnel"
+  secret     = base64encode(random_bytes.tunnel_secret.result)
+}
+
+# Generate random tunnel secret
+resource "random_bytes" "tunnel_secret" {
+  length = 32
+}
+
+# Create Cloudflare Tunnel configuration
+resource "cloudflare_tunnel_config" "openhands" {
+  account_id = var.cloudflare_account_id
+  tunnel_id  = cloudflare_tunnel.openhands.id
+
+  config {
+    ingress_rule {
+      hostname = "${var.subdomain}.${var.domain_name}"
+      service  = "http://localhost:3000"
+    }
+    ingress_rule {
+      service = "http_status:404"
+    }
+  }
+}
+
+# Create CNAME DNS record pointing to Cloudflare tunnel
+resource "cloudflare_record" "openhands" {
+  zone_id = var.cloudflare_zone_id
+  name    = var.subdomain
+  type    = "CNAME"
+  content = "${cloudflare_tunnel.openhands.cname}"
+  ttl     = 1
+  proxied = true
+}
+
+# ==================== OUTPUTS ====================
+
+output "tunnel_token" {
+  description = "Token to use when setting up cloudflared on the VM"
+  value       = cloudflare_tunnel.openhands.tunnel_token
+  sensitive   = true
+}
+
+output "tunnel_name" {
+  description = "Tunnel name"
+  value       = cloudflare_tunnel.openhands.name
+}
+
+output "access_url" {
+  description = "URL to access your Open Hands server"
+  value       = "https://${var.subdomain}.${var.domain_name}"
+}
+
+output "reserved_ip" {
+  description = "Reserved public IP address"
+  value       = oci_core_public_ip.reserved_ip.ip_address
+}
+
+output "instance_id" {
+  description = "Instance ID"
+  value       = oci_core_instance.always_free_vm.id
+}
+
+output "instance_public_ip" {
+  description = "Instance public IP"
+  value       = oci_core_instance.always_free_vm.public_ip
+}
+
+output "instance_private_ip" {
+  description = "Instance private IP"
+  value       = oci_core_instance.always_free_vm.private_ip
+}
+
+output "ssh_command" {
+  description = "SSH command to connect to the instance"
+  value       = "ssh -i /home/ty/.ssh/ssh.key opc@${oci_core_instance.always_free_vm.public_ip}"
+}
