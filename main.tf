@@ -1,5 +1,10 @@
+
 locals {
   setup_script_hash = filesha256("${path.module}/setup.sh")
+}
+
+provider "cloudflare" {
+  api_token = var.cloudflare_api_token
 }
 
 # Reserve a Public IP Address
@@ -24,32 +29,10 @@ resource "oci_core_instance" "always_free_vm" {
     ssh_authorized_keys = var.ssh_public_key
   }
 
-  connection {
-    type        = "ssh"
-    user        = "opc"
-    private_key = file("/home/ty/.ssh/ssh.key")
-    host        = oci_core_public_ip.reserved_ip.ip_address
-    timeout     = "10m"
-  }
-
-  # Copy setup.sh to the remote VM
-  provisioner "file" {
-    source      = "${path.module}/setup.sh"
-    destination = "/tmp/setup.sh"
-  }
-
-  # Execute the script on the remote VM
-  #provisioner "remote-exec" {
-    #inline = [
-      #"chmod +x /tmp/setup.sh",
-      #"sudo bash /tmp/setup.sh"
-    #]
-  #}
-
   create_vnic_details {
     subnet_id              = oci_core_subnet.public_subnet.id
     display_name           = "Primary VNIC"
-    assign_public_ip       = false
+    assign_public_ip       = true
     private_ip             = "10.0.1.10"
     skip_source_dest_check = false
     nsg_ids                = [oci_core_network_security_group.free_nsg.id]
@@ -70,6 +53,10 @@ resource "oci_core_instance" "always_free_vm" {
     Name        = "Always Free VM"
     Environment = "Production"
   }
+
+  lifecycle {
+    ignore_changes = [metadata]
+  }
 }
 
 # Get the VNIC attachment details
@@ -89,6 +76,54 @@ resource "oci_core_public_ip" "reserved_ip_assignment" {
   lifetime       = "RESERVED"
   private_ip_id  = data.oci_core_private_ips.primary_vnic_ip.private_ips[0].id
   display_name   = "Always-Free-VM-Reserved-IP-Assignment"
+
+  depends_on = [oci_core_instance.always_free_vm]
+}
+
+# Wait for SSH to be available, then run provisioners
+resource "null_resource" "vm_setup" {
+  provisioner "remote-exec" {
+    inline = ["echo 'SSH is ready'"]
+
+    connection {
+      type        = "ssh"
+      user        = "opc"
+      private_key = file("/home/ty/.ssh/ssh.key")
+      host        = oci_core_instance.always_free_vm.public_ip
+      timeout     = "10m"
+      agent       = false
+    }
+  }
+
+  provisioner "file" {
+    source      = "${path.module}/setup.sh"
+    destination = "/tmp/setup.sh"
+
+    connection {
+      type        = "ssh"
+      user        = "opc"
+      private_key = file("/home/ty/.ssh/ssh.key")
+      host        = oci_core_instance.always_free_vm.public_ip
+      timeout     = "10m"
+      agent       = false
+    }
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "chmod +x /tmp/setup.sh",
+      "sudo bash /tmp/setup.sh"
+    ]
+
+    connection {
+      type        = "ssh"
+      user        = "opc"
+      private_key = file("/home/ty/.ssh/ssh.key")
+      host        = oci_core_instance.always_free_vm.public_ip
+      timeout     = "10m"
+      agent       = false
+    }
+  }
 
   depends_on = [oci_core_instance.always_free_vm]
 }
@@ -157,7 +192,7 @@ resource "oci_core_network_security_group_security_rule" "ssh_in" {
   }
 }
 
-# Allow HTTP Ingress
+# Allow HTTP Ingress (for Cloudflare tunnel validation)
 resource "oci_core_network_security_group_security_rule" "http_in" {
   network_security_group_id = oci_core_network_security_group.free_nsg.id
   direction                 = "INGRESS"
@@ -174,7 +209,7 @@ resource "oci_core_network_security_group_security_rule" "http_in" {
   }
 }
 
-# Allow HTTPS Ingress
+# Allow HTTPS Ingress (for Cloudflare tunnel validation)
 resource "oci_core_network_security_group_security_rule" "https_in" {
   network_security_group_id = oci_core_network_security_group.free_nsg.id
   direction                 = "INGRESS"
@@ -201,6 +236,8 @@ resource "oci_core_network_security_group_security_rule" "egress" {
   stateless                 = false
 }
 
+# NOTE: Port 3000 is NOT exposed globally. Only cloudflared will access it via localhost.
+
 # Data source to get the Oracle Linux image
 data "oci_core_images" "oracle_linux" {
   compartment_id           = var.compartment_ocid
@@ -215,4 +252,46 @@ data "oci_core_images" "oracle_linux" {
 data "oci_identity_availability_domains" "ads" {
   compartment_id = var.tenancy_ocid
 }
+
+# ==================== CLOUDFLARE ZERO TRUST ====================
+
+# Generate random tunnel secret
+resource "random_string" "tunnel_secret" {
+  length = 32
+  special = true
+}
+
+# Create Cloudflare Tunnel
+resource "cloudflare_tunnel" "openhands" {
+  account_id = var.cloudflare_account_id
+  name       = "openhands-tunnel"
+  secret     = base64encode(random_string.tunnel_secret.result)
+}
+
+# Create Cloudflare Tunnel configuration
+resource "cloudflare_tunnel_config" "openhands" {
+  account_id = var.cloudflare_account_id
+  tunnel_id  = cloudflare_tunnel.openhands.id
+
+  config {
+    ingress_rule {
+      hostname = "${var.subdomain}.${var.domain_name}"
+      service  = "http://localhost:3000"
+    }
+    ingress_rule {
+      service = "http_status:404"
+    }
+  }
+}
+
+# Create CNAME DNS record pointing to Cloudflare tunnel
+resource "cloudflare_record" "openhands" {
+  zone_id = var.cloudflare_zone_id
+  name    = var.subdomain
+  type    = "CNAME"
+  content = "${cloudflare_tunnel.openhands.cname}"
+  ttl     = 1
+  proxied = true
+}
+
 

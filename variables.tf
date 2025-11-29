@@ -51,3 +51,28 @@ variable "availability_domain_index" {
   type        = number
   default     = 0
 }
+
+variable "domain_name" {
+  description = "the domain suffix for the DNS record"
+  type        = string
+}
+
+variable "subdomain" {
+  description = "the domain prefix for the DNS record"
+  type        = string
+}
+
+variable "cloudflare_api_token" {
+  description = "the cloudflare api token"
+  type        = string
+}
+
+variable "cloudflare_account_id" {
+  description = "the cloudflare account id"
+  type        = string
+}
+
+variable "cloudflare_zone_id" {
+  description = "the cloudflare zone id"
+  type        = string
+}
