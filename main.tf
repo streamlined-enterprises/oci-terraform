@@ -1,7 +1,17 @@
 locals {
   setup_script_hash = filesha256("${path.module}/setup.sh")
 }
- 
+
+# Reserve a Public IP Address
+resource "oci_core_public_ip" "reserved_ip" {
+  compartment_id = var.compartment_ocid
+  display_name   = "Always-Free-VM-Reserved-IP"
+  lifetime       = "RESERVED"
+  freeform_tags = {
+    Name        = "Always Free VM Public IP"
+    Environment = "Production"
+  }
+}
 
 # Configure the Compute Instance
 resource "oci_core_instance" "always_free_vm" {
@@ -11,35 +21,35 @@ resource "oci_core_instance" "always_free_vm" {
   shape               = var.instance_shape
 
   metadata = {
-    # 1. This is the script OCI will run on boot. It must be Base64-encoded.
     ssh_authorized_keys = var.ssh_public_key
-    user_data = base64encode(file("${path.module}/setup.sh"))
-
-    # 2. This is the trigger. It is a custom key-value pair that OCI ignores
-    # but that Terraform uses to detect a change.
-    trigger = local.setup_script_hash 
   }
-
 
   connection {
     type        = "ssh"
-    user        = "opc" # Default user for Oracle Linux on OCI
-    private_key = file("/home/ty/.ssh/ssh.key") # Use the path to your now 600-permission key
-    host        = self.public_ip # Automatically use the new VM's public IP
-    timeout     = "5m" # Give enough time for setup
+    user        = "opc"
+    private_key = file("/home/ty/.ssh/ssh.key")
+    host        = oci_core_public_ip.reserved_ip.ip_address
+    timeout     = "10m"
   }
 
- 
-  provisioner "remote-exec" {
-    inline = [
-      "sudo bash -c '${file("${path.module}/setup.sh")}'"
-    ]
+  # Copy setup.sh to the remote VM
+  provisioner "file" {
+    source      = "${path.module}/setup.sh"
+    destination = "/tmp/setup.sh"
   }
+
+  # Execute the script on the remote VM
+  #provisioner "remote-exec" {
+    #inline = [
+      #"chmod +x /tmp/setup.sh",
+      #"sudo bash /tmp/setup.sh"
+    #]
+  #}
 
   create_vnic_details {
     subnet_id              = oci_core_subnet.public_subnet.id
     display_name           = "Primary VNIC"
-    assign_public_ip       = true
+    assign_public_ip       = false
     private_ip             = "10.0.1.10"
     skip_source_dest_check = false
     nsg_ids                = [oci_core_network_security_group.free_nsg.id]
@@ -50,15 +60,37 @@ resource "oci_core_instance" "always_free_vm" {
     source_id               = "ocid1.image.oc1.us-chicago-1.aaaaaaaasrbvw2qh25ewu3gg2div6bkwvqdi2oilwxirhic3qa5tzzxrcdwa"
     boot_volume_size_in_gbs = 50
   }
+
   shape_config {
     memory_in_gbs = "6"
-    ocpus = "1"
+    ocpus         = "1"
   }
 
   freeform_tags = {
     Name        = "Always Free VM"
     Environment = "Production"
   }
+}
+
+# Get the VNIC attachment details
+data "oci_core_vnic_attachments" "vm_vnic" {
+  compartment_id = var.compartment_ocid
+  instance_id    = oci_core_instance.always_free_vm.id
+}
+
+# Get the private IP of the primary VNIC
+data "oci_core_private_ips" "primary_vnic_ip" {
+  vnic_id = data.oci_core_vnic_attachments.vm_vnic.vnic_attachments[0].vnic_id
+}
+
+# Associate the reserved IP with the primary VNIC's private IP
+resource "oci_core_public_ip" "reserved_ip_assignment" {
+  compartment_id = var.compartment_ocid
+  lifetime       = "RESERVED"
+  private_ip_id  = data.oci_core_private_ips.primary_vnic_ip.private_ips[0].id
+  display_name   = "Always-Free-VM-Reserved-IP-Assignment"
+
+  depends_on = [oci_core_instance.always_free_vm]
 }
 
 # Create Virtual Cloud Network
@@ -183,3 +215,4 @@ data "oci_core_images" "oracle_linux" {
 data "oci_identity_availability_domains" "ads" {
   compartment_id = var.tenancy_ocid
 }
+

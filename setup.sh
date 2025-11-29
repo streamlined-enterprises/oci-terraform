@@ -1,6 +1,5 @@
 exit 0
 
-
 sudo dnf update -y
 # Install Docker: use dnf for Oracle Linux
 sudo dnf install -y dnf-utils zip unzip
