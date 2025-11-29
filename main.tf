@@ -1,87 +1,185 @@
-# --- 1. VCN and Subnet (VCN is Always Free) ---
-resource "oci_core_vcn" "llm_vcn" {
+locals {
+  setup_script_hash = filesha256("${path.module}/setup.sh")
+}
+ 
+
+# Configure the Compute Instance
+resource "oci_core_instance" "always_free_vm" {
+  availability_domain = data.oci_identity_availability_domains.ads.availability_domains[0].name
+  compartment_id      = var.compartment_ocid
+  display_name        = "Always-Free-VM"
+  shape               = var.instance_shape
+
+  metadata = {
+    # 1. This is the script OCI will run on boot. It must be Base64-encoded.
+    ssh_authorized_keys = var.ssh_public_key
+    user_data = base64encode(file("${path.module}/setup.sh"))
+
+    # 2. This is the trigger. It is a custom key-value pair that OCI ignores
+    # but that Terraform uses to detect a change.
+    trigger = local.setup_script_hash 
+  }
+
+
+  connection {
+    type        = "ssh"
+    user        = "opc" # Default user for Oracle Linux on OCI
+    private_key = file("/home/ty/.ssh/ssh.key") # Use the path to your now 600-permission key
+    host        = self.public_ip # Automatically use the new VM's public IP
+    timeout     = "5m" # Give enough time for setup
+  }
+
+ 
+  provisioner "remote-exec" {
+    inline = [
+      "sudo bash -c '${file("${path.module}/setup.sh")}'"
+    ]
+  }
+
+  create_vnic_details {
+    subnet_id              = oci_core_subnet.public_subnet.id
+    display_name           = "Primary VNIC"
+    assign_public_ip       = true
+    private_ip             = "10.0.1.10"
+    skip_source_dest_check = false
+    nsg_ids                = [oci_core_network_security_group.free_nsg.id]
+  }
+
+  source_details {
+    source_type             = "IMAGE"
+    source_id               = "ocid1.image.oc1.us-chicago-1.aaaaaaaasrbvw2qh25ewu3gg2div6bkwvqdi2oilwxirhic3qa5tzzxrcdwa"
+    boot_volume_size_in_gbs = 50
+  }
+  shape_config {
+    memory_in_gbs = "6"
+    ocpus = "1"
+  }
+
+  freeform_tags = {
+    Name        = "Always Free VM"
+    Environment = "Production"
+  }
+}
+
+# Create Virtual Cloud Network
+resource "oci_core_vcn" "free_vcn" {
   cidr_block     = "10.0.0.0/16"
+  display_name   = "always-free-vcn"
   compartment_id = var.compartment_ocid
-  display_name   = "LLM-VCN"
+  dns_label      = "alwaysfreevcn"
 }
 
-resource "oci_core_subnet" "llm_subnet" {
-  cidr_block     = "10.0.1.0/24"
+# Create Internet Gateway
+resource "oci_core_internet_gateway" "free_igw" {
   compartment_id = var.compartment_ocid
-  vcn_id         = oci_core_vcn.llm_vcn.id
-  display_name   = "LLM-Subnet"
-  # Use VCN's default route and DNS
-  route_table_id = oci_core_vcn.llm_vcn.default_route_table_id
-  dns_label      = "llmsubnet"
-  prohibit_public_ip_on_vnic = false # Crucial for internet access
+  display_name   = "always-free-igw"
+  vcn_id         = oci_core_vcn.free_vcn.id
 }
 
-# --- 2. Security List (Firewall Rules) ---
-resource "oci_core_security_list" "llm_security_list" {
-  compartment_id = var.compartment_ocid
-  vcn_id         = oci_core_vcn.llm_vcn.id
-  display_name   = "LLM-Security-List"
+# Create Public Subnet
+resource "oci_core_subnet" "public_subnet" {
+  availability_domain = data.oci_identity_availability_domains.ads.availability_domains[0].name
+  cidr_block          = "10.0.1.0/24"
+  display_name        = "public-subnet"
+  dns_label           = "public"
+  compartment_id      = var.compartment_ocid
+  vcn_id              = oci_core_vcn.free_vcn.id
 
-  # Ingress Rule: Allow SSH (Port 22) from anywhere
-  ingress_security_rules {
-    protocol  = "6" # TCP
-    source    = "0.0.0.0/0"
-    tcp_options {
-      destination_port_range {
-        min = 22
-        max = 22
-      }
+  route_table_id = oci_core_route_table.public_route_table.id
+}
+
+# Create Route Table
+resource "oci_core_route_table" "public_route_table" {
+  compartment_id = var.compartment_ocid
+  display_name   = "public-route-table"
+  vcn_id         = oci_core_vcn.free_vcn.id
+
+  route_rules {
+    destination       = "0.0.0.0/0"
+    destination_type  = "CIDR_BLOCK"
+    network_entity_id = oci_core_internet_gateway.free_igw.id
+  }
+}
+
+# Create Network Security Group
+resource "oci_core_network_security_group" "free_nsg" {
+  compartment_id = var.compartment_ocid
+  display_name   = "always-free-nsg"
+  vcn_id         = oci_core_vcn.free_vcn.id
+}
+
+# Allow SSH Ingress
+resource "oci_core_network_security_group_security_rule" "ssh_in" {
+  network_security_group_id = oci_core_network_security_group.free_nsg.id
+  direction                 = "INGRESS"
+  protocol                  = "6"
+  source                    = "0.0.0.0/0"
+  source_type               = "CIDR_BLOCK"
+  stateless                 = false
+
+  tcp_options {
+    destination_port_range {
+      min = 22
+      max = 22
     }
   }
+}
 
-  # Ingress Rule: Allow Cloudflare (Cloudflared will handle the Ollama port 11434 access)
-  # You don't need to expose 11434 to the internet, only to Cloudflared running on the VM.
-  # Allowing Ingress from the VM itself and all egress is often enough.
+# Allow HTTP Ingress
+resource "oci_core_network_security_group_security_rule" "http_in" {
+  network_security_group_id = oci_core_network_security_group.free_nsg.id
+  direction                 = "INGRESS"
+  protocol                  = "6"
+  source                    = "0.0.0.0/0"
+  source_type               = "CIDR_BLOCK"
+  stateless                 = false
 
-  # Egress Rule: Allow all traffic out (needed for Ollama model pulls and Cloudflared)
-  egress_security_rules {
-    protocol    = "all"
-    destination = "0.0.0.0/0"
+  tcp_options {
+    destination_port_range {
+      min = 80
+      max = 80
+    }
   }
 }
 
-resource "oci_core_vnic_attachment" "llm_vnic_attachment" {
-  instance_id = oci_core_instance.ollama_vm.id
-  create_vnic_details {
-    subnet_id              = oci_core_subnet.llm_subnet.id
-    security_list_ids      = [oci_core_security_list.llm_security_list.id]
-    assign_public_ip       = true
-    skip_source_dest_check = true
+# Allow HTTPS Ingress
+resource "oci_core_network_security_group_security_rule" "https_in" {
+  network_security_group_id = oci_core_network_security_group.free_nsg.id
+  direction                 = "INGRESS"
+  protocol                  = "6"
+  source                    = "0.0.0.0/0"
+  source_type               = "CIDR_BLOCK"
+  stateless                 = false
+
+  tcp_options {
+    destination_port_range {
+      min = 443
+      max = 443
+    }
   }
 }
 
+# Allow Egress
+resource "oci_core_network_security_group_security_rule" "egress" {
+  network_security_group_id = oci_core_network_security_group.free_nsg.id
+  direction                 = "EGRESS"
+  protocol                  = "all"
+  destination               = "0.0.0.0/0"
+  destination_type          = "CIDR_BLOCK"
+  stateless                 = false
+}
 
-# --- 3. Compute Instance (VM.Standard.A1.Flex - Always Free) ---
-resource "oci_core_instance" "ollama_vm" {
-  compartment_id      = var.compartment_ocid
-  display_name        = var.instance_display_name
-  shape               = "VM.Standard.A1.Flex" # Always Free Ampere A1 Flex
-  shape_config {
-    ocpus               = 4 # Max OCPUs in Always Free tier
-    memory_in_gbs       = 24 # Max RAM in Always Free tier
-  }
+# Data source to get the Oracle Linux image
+data "oci_core_images" "oracle_linux" {
+  compartment_id           = var.compartment_ocid
+  operating_system         = "Oracle Linux"
+  operating_system_version = "8"
+  sort_by                  = "TIMECREATED"
+  sort_order               = "DESC"
+  shape                    = var.instance_shape
+}
 
-  # Use an Always Free eligible Linux image (e.g., Ubuntu or Oracle Linux)
-  source_details {
-    source_type = "image"
-    # Find a public image OCID for your region (e.g., Ubuntu/Oracle Linux)
-    # This OCID must be updated to an Always Free eligible image in your region.
-    # Placeholder: Replace with actual OCID from OCI Console or data source
-    source_id   = "ocid1.image.oc1.us-chicago-1.aaaaaaaasrbvw2qh25ewu3gg2div6bkwvqdi2oilwxirhic3qa5tzzxrcdwa"
-  }
-
-  # SSH Keys for access
-  metadata = {
-    ssh_authorized_keys = var.ssh_public_key
-  }
-
-  # Boot volume size (min 47GB, max 200GB in Always Free)
-  create_vnic_details {
-    subnet_id = oci_core_subnet.llm_subnet.id
-  }
+# Data source to get availability domains
+data "oci_identity_availability_domains" "ads" {
+  compartment_id = var.tenancy_ocid
 }
