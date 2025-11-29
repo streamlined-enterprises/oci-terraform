@@ -1,4 +1,3 @@
-
 locals {
   setup_script_hash = filesha256("${path.module}/setup.sh")
 }
@@ -27,12 +26,13 @@ resource "oci_core_instance" "always_free_vm" {
 
   metadata = {
     ssh_authorized_keys = var.ssh_public_key
+    user_data           = base64encode(file("${path.module}/setup.sh"))
   }
 
   create_vnic_details {
     subnet_id              = oci_core_subnet.public_subnet.id
     display_name           = "Primary VNIC"
-    assign_public_ip       = true
+    assign_public_ip       = false
     private_ip             = "10.0.1.10"
     skip_source_dest_check = false
     nsg_ids                = [oci_core_network_security_group.free_nsg.id]
@@ -53,10 +53,6 @@ resource "oci_core_instance" "always_free_vm" {
     Name        = "Always Free VM"
     Environment = "Production"
   }
-
-  lifecycle {
-    ignore_changes = [metadata]
-  }
 }
 
 # Get the VNIC attachment details
@@ -76,54 +72,6 @@ resource "oci_core_public_ip" "reserved_ip_assignment" {
   lifetime       = "RESERVED"
   private_ip_id  = data.oci_core_private_ips.primary_vnic_ip.private_ips[0].id
   display_name   = "Always-Free-VM-Reserved-IP-Assignment"
-
-  depends_on = [oci_core_instance.always_free_vm]
-}
-
-# Wait for SSH to be available, then run provisioners
-resource "null_resource" "vm_setup" {
-  provisioner "remote-exec" {
-    inline = ["echo 'SSH is ready'"]
-
-    connection {
-      type        = "ssh"
-      user        = "opc"
-      private_key = file("/home/ty/.ssh/ssh.key")
-      host        = oci_core_instance.always_free_vm.public_ip
-      timeout     = "10m"
-      agent       = false
-    }
-  }
-
-  provisioner "file" {
-    source      = "${path.module}/setup.sh"
-    destination = "/tmp/setup.sh"
-
-    connection {
-      type        = "ssh"
-      user        = "opc"
-      private_key = file("/home/ty/.ssh/ssh.key")
-      host        = oci_core_instance.always_free_vm.public_ip
-      timeout     = "10m"
-      agent       = false
-    }
-  }
-
-  provisioner "remote-exec" {
-    inline = [
-      "chmod +x /tmp/setup.sh",
-      "sudo bash /tmp/setup.sh"
-    ]
-
-    connection {
-      type        = "ssh"
-      user        = "opc"
-      private_key = file("/home/ty/.ssh/ssh.key")
-      host        = oci_core_instance.always_free_vm.public_ip
-      timeout     = "10m"
-      agent       = false
-    }
-  }
 
   depends_on = [oci_core_instance.always_free_vm]
 }
@@ -257,7 +205,7 @@ data "oci_identity_availability_domains" "ads" {
 
 # Generate random tunnel secret
 resource "random_string" "tunnel_secret" {
-  length = 32
+  length  = 32
   special = true
 }
 
@@ -293,5 +241,4 @@ resource "cloudflare_record" "openhands" {
   ttl     = 1
   proxied = true
 }
-
 
