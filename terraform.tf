@@ -6,6 +6,13 @@ terraform {
       source  = "oracle/oci"
       version = "~> 6.0"
     }
+    cloudflare = {
+      source  = "cloudflare/cloudflare"
+      version = "~> 4.0"
+    }
+    random = {
+      source = "hashicorp/random"
+    }
   }
 
   # Uncomment to use remote state backend
