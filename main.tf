@@ -15,6 +15,9 @@ resource "oci_core_public_ip" "reserved_ip" {
     Name        = "Always Free VM Public IP"
     Environment = "Production"
   }
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # Configure the Compute Instance
@@ -26,7 +29,29 @@ resource "oci_core_instance" "always_free_vm" {
 
   metadata = {
     ssh_authorized_keys = var.ssh_public_key
-    user_data           = base64encode(file("${path.module}/setup.sh"))
+    # user_data           = base64encode(file("${path.module}/setup.sh"))
+  }
+
+  connection {
+    type        = "ssh"
+    user        = "opc"
+    private_key = file("/home/ty/.ssh/ssh.key")
+    host        = self.public_ip
+    timeout     = "10m"
+    agent       = false
+  }
+
+  provisioner "file" {
+    host = oci_core_public_ip.reserved_ip.ip_address
+    source      = "${path.module}/setup.sh"
+    destination = "/tmp/setup.sh"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "chmod +x /tmp/setup.sh",
+      "CLOUDFLARE_TUNNEL_TOKEN='${cloudflare_zero_trust_tunnel_cloudflared.openhands.tunnel_token}' sudo bash /tmp/setup.sh"
+    ]
   }
 
   create_vnic_details {
@@ -210,16 +235,16 @@ resource "random_string" "tunnel_secret" {
 }
 
 # Create Cloudflare Tunnel
-resource "cloudflare_tunnel" "openhands" {
+resource "cloudflare_zero_trust_tunnel_cloudflared" "openhands" {
   account_id = var.cloudflare_account_id
   name       = "openhands-tunnel"
   secret     = base64encode(random_string.tunnel_secret.result)
 }
 
 # Create Cloudflare Tunnel configuration
-resource "cloudflare_tunnel_config" "openhands" {
+resource "cloudflare_zero_trust_tunnel_cloudflared_config" "openhands" {
   account_id = var.cloudflare_account_id
-  tunnel_id  = cloudflare_tunnel.openhands.id
+  tunnel_id  = cloudflare_zero_trust_tunnel_cloudflared.openhands.id
 
   config {
     ingress_rule {
@@ -237,7 +262,7 @@ resource "cloudflare_record" "openhands" {
   zone_id = var.cloudflare_zone_id
   name    = var.subdomain
   type    = "CNAME"
-  content = "${cloudflare_tunnel.openhands.cname}"
+  content = "${cloudflare_zero_trust_tunnel_cloudflared.openhands.cname}"
   ttl     = 1
   proxied = true
 }
