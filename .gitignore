@@ -37,4 +37,5 @@ override.tf.json
 terraform.rc
 .aider*
 
-terraform*log
+terraform*.log
+
