@@ -1,3 +1,47 @@
+#!/bin/bash
+set -e
+
+exit 0
+
+# ==================== OPEN HANDS SETUP ====================
+# All your existing Open Hands installation commands go here
+# Example:
+# sudo yum update -y
+# sudo yum install -y nodejs
+# git clone https://github.com/All-Hands-AI/OpenHands.git
+# cd OpenHands
+# npm install
+# # etc...
+
+# ==================== CLOUDFLARE TUNNEL SETUP ====================
+
+TUNNEL_TOKEN="${CLOUDFLARE_TUNNEL_TOKEN}"
+
+if [ -z "$TUNNEL_TOKEN" ]; then
+  echo "Error: CLOUDFLARE_TUNNEL_TOKEN environment variable not set"
+  exit 1
+fi
+
+echo "Installing cloudflared with tunnel token..."
+
+# Download and install cloudflared
+cd /tmp
+wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.rpm
+rpm -ivh cloudflared-linux-amd64.rpm
+
+# Install the service
+cloudflared service install "$TUNNEL_TOKEN"
+
+# Start and enable the service
+systemctl start cloudflared
+systemctl enable cloudflared
+
+# Verify it's running
+sleep 2
+systemctl status cloudflared
+
+echo "Cloudflared tunnel installed and started successfully!"
+
 exit 0
 
 sudo dnf update -y

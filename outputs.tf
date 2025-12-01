@@ -30,13 +30,13 @@ output "management_url" {
 
 output "tunnel_token" {
   description = "Token to use when setting up cloudflared on the VM"
-  value       = cloudflare_tunnel.openhands.tunnel_token
+  value       = cloudflare_zero_trust_tunnel_cloudflared.openhands.tunnel_token
   sensitive   = true
 }
 
 output "tunnel_name" {
   description = "Tunnel name"
-  value       = cloudflare_tunnel.openhands.name
+  value       = cloudflare_zero_trust_tunnel_cloudflared.openhands.name
 }
 
 output "access_url" {

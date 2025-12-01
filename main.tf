@@ -1,3 +1,4 @@
+
 locals {
   setup_script_hash = filesha256("${path.module}/setup.sh")
 }
@@ -6,18 +7,22 @@ provider "cloudflare" {
   api_token = var.cloudflare_api_token
 }
 
-# Reserve a Public IP Address
+# Reserve and assign a Public IP Address
 resource "oci_core_public_ip" "reserved_ip" {
   compartment_id = var.compartment_ocid
-  display_name   = "Always-Free-VM-Reserved-IP"
   lifetime       = "RESERVED"
+  private_ip_id  = data.oci_core_private_ips.primary_vnic_ip.private_ips[0].id
+  display_name   = "Always-Free-VM-Reserved-IP"
   freeform_tags = {
     Name        = "Always Free VM Public IP"
     Environment = "Production"
   }
-  lifecycle {
-    prevent_destroy = true
-  }
+
+  depends_on = [oci_core_instance.always_free_vm]
+
+  #lifecycle {
+    #prevent_destroy = true
+  #}
 }
 
 # Configure the Compute Instance
@@ -29,29 +34,6 @@ resource "oci_core_instance" "always_free_vm" {
 
   metadata = {
     ssh_authorized_keys = var.ssh_public_key
-    # user_data           = base64encode(file("${path.module}/setup.sh"))
-  }
-
-  connection {
-    type        = "ssh"
-    user        = "opc"
-    private_key = file("/home/ty/.ssh/ssh.key")
-    host        = self.public_ip
-    timeout     = "10m"
-    agent       = false
-  }
-
-  provisioner "file" {
-    host = oci_core_public_ip.reserved_ip.ip_address
-    source      = "${path.module}/setup.sh"
-    destination = "/tmp/setup.sh"
-  }
-
-  provisioner "remote-exec" {
-    inline = [
-      "chmod +x /tmp/setup.sh",
-      "CLOUDFLARE_TUNNEL_TOKEN='${cloudflare_zero_trust_tunnel_cloudflared.openhands.tunnel_token}' sudo bash /tmp/setup.sh"
-    ]
   }
 
   create_vnic_details {
@@ -91,14 +73,30 @@ data "oci_core_private_ips" "primary_vnic_ip" {
   vnic_id = data.oci_core_vnic_attachments.vm_vnic.vnic_attachments[0].vnic_id
 }
 
-# Associate the reserved IP with the primary VNIC's private IP
-resource "oci_core_public_ip" "reserved_ip_assignment" {
-  compartment_id = var.compartment_ocid
-  lifetime       = "RESERVED"
-  private_ip_id  = data.oci_core_private_ips.primary_vnic_ip.private_ips[0].id
-  display_name   = "Always-Free-VM-Reserved-IP-Assignment"
+# Run provisioners after reserved IP is assigned
+resource "null_resource" "vm_provisioner" {
+  connection {
+    type        = "ssh"
+    user        = "opc"
+    private_key = file("/home/ty/.ssh/ssh.key")
+    host        = oci_core_public_ip.reserved_ip.ip_address
+    timeout     = "10m"
+    agent       = false
+  }
 
-  depends_on = [oci_core_instance.always_free_vm]
+  provisioner "file" {
+    source      = "${path.module}/setup.sh"
+    destination = "/tmp/setup.sh"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "chmod +x /tmp/setup.sh",
+      "CLOUDFLARE_TUNNEL_TOKEN='${cloudflare_zero_trust_tunnel_cloudflared.openhands.tunnel_token}' sudo bash /tmp/setup.sh"
+    ]
+  }
+
+  depends_on = [oci_core_public_ip.reserved_ip]
 }
 
 # Create Virtual Cloud Network
@@ -266,4 +264,3 @@ resource "cloudflare_record" "openhands" {
   ttl     = 1
   proxied = true
 }
-
