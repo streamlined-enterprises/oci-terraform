@@ -80,7 +80,7 @@ resource "null_resource" "vm_provisioner" {
     user        = "opc"
     private_key = file("/home/ty/.ssh/ssh.key")
     host        = oci_core_public_ip.reserved_ip.ip_address
-    timeout     = "10m"
+    timeout     = "30m"
     agent       = false
   }
 
@@ -90,11 +90,12 @@ resource "null_resource" "vm_provisioner" {
   }
 
   provisioner "remote-exec" {
-    inline = [
-      "chmod +x /tmp/setup.sh",
-      "CLOUDFLARE_TUNNEL_TOKEN='${cloudflare_zero_trust_tunnel_cloudflared.openhands.tunnel_token}' sudo bash /tmp/setup.sh"
-    ]
-  }
+   inline = [
+     "export CLOUDFLARE_TUNNEL_TOKEN='${cloudflare_zero_trust_tunnel_cloudflared.openhands.tunnel_token}'",
+     "chmod +x /tmp/setup.sh",
+     "sudo -E bash /tmp/setup.sh > /tmp/setup.log 2>&1"
+   ]
+ }
 
   depends_on = [oci_core_public_ip.reserved_ip]
 }

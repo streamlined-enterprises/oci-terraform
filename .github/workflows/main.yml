@@ -1,0 +1,59 @@
+name: OCI Infrastructure Deployment
+on:
+  # Allows manual runs from the GitHub UI
+  workflow_dispatch:
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      # --- SSH PRIVATE KEY HANDLING ---
+      - name: 🔑 Write Private Key to File
+        id: write_key
+        run: |
+          # 1. Create the private key file from the secret content
+          echo "${{ secrets.TF_SECRET_OCI_PRIVATE_KEY }}" > oci_api_key.pem
+          # 2. Set necessary permissions for the key
+          chmod 600 oci_api_key.pem
+        
+      # --- TERRAFORM EXECUTION ---
+      - name: Terraform Init and Apply
+        env:
+          TF_VAR_tenancy_ocid: ocid1.tenancy.oc1..aaaaaaaavocih5w72aex63uv7hngi7wq5wntycvxq6bdyaaiwow3wsge4oza
+          TF_VAR_compartment_ocid: ocid1.tenancy.oc1..aaaaaaaavocih5w72aex63uv7hngi7wq5wntycvxq6bdyaaiwow3wsge4oza
+          TF_VAR_user_ocid: ocid1.user.oc1..aaaaaaaa3pkihtxuik7bgkqq5mlygvvcpfzatub6jewkxtf6hij2lgvvo62q
+          TF_VAR_fingerprint: ea:4d:c0:02:2a:59:53:1e:3f:ef:7f:2b:f7:98:e2:9d
+          TF_VAR_region: us-chicago-1
+          
+          TF_VAR_private_key_path: "./oci_api_key.pem"
+          
+          TF_VAR_cloudflare_api_token: ${{ secrets.TF_SECRET_CLOUDFLARE_API_TOKEN }}
+          TF_VAR_cloudflare_account_id: 7afc5c5ae6d25a679125939bf9b7b434
+          TF_VAR_cloudflare_zone_id: e578aed8f08231dee4e84d3759b38727 
+          
+          TF_VAR_instance_shape: VM.Standard.A1.Flex 
+          TF_VAR_availability_domain_index: 1
+          TF_VAR_ssh_public_key: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCMD27xoPXu6vlkVyHpW+hy3oXmLxYvNIca6RtkFp9PjKW237eX4/J1gMFbddRdPr4K2+LSVvZfaMbn/8iPpHu7jxFEBsq1mlrdt0tW+zzhPco5QFYFF64c9MXnYujtZni1tDyigfmLQzLOmcS6o+iiX5j3ByW8eBUOoiYR3ZcuePMozR9M+7CD4UHJl7oEvhtRmFr+NL2jvLHJfzhy56PWMJO05kNyOdDXLy2wmT8XzLxVjp2C6CWZ0S9PlbjN7pvK9QydC9ldh++A3pWt2Z1f9pNZIQ7Axsw5SBbbC2xjsoJTj1q505sq30XTk/veK5cGDsUJ8frZ9dQoUSsnmGiZ"
+          TF_VAR_domain_name: "streamline.it.com" # Using example
+          TF_VAR_subdomain: "openhands" # Using example
+
+        run: |
+          # Initialize Terraform
+          terraform init
+          
+          # Taint the required resources
+          terraform taint null_resource.vm_provisioner || true
+          terraform taint oci_core_instance.always_free_vm || true
+          
+          # Apply the changes
+          terraform apply -auto-approve

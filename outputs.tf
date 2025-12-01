@@ -51,5 +51,6 @@ output "reserved_ip" {
 
 output "ssh_command" {
   description = "SSH command to connect to the instance"
-  value       = "ssh -i /home/ty/.ssh/ssh.key opc@${oci_core_instance.always_free_vm.public_ip}"
+  #value       = "ssh -i /home/ty/.ssh/ssh.key opc@${oci_core_instance.always_free_vm.public_ip}"
+  value       = "ssh -i /home/ty/.ssh/ssh.key opc@${oci_core_public_ip.reserved_ip.ip_address}"
 }
