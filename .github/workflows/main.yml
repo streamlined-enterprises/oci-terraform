@@ -249,9 +249,12 @@ jobs:
             echo "Waiting for VNIC... ($i/10)"
             sleep 10
           done
+          if [ -z "$VNIC_ID" ] || [ "$VNIC_ID" = "null" ]; then
+            echo "ERROR: Could not retrieve VNIC after 10 attempts."
+            exit 1
+          fi
           echo "VNIC: $VNIC_ID"
 
-          # --vnic-id filter removed in oci_cli 3.x; use --subnet-id + --ip-address
           PRIVATE_IP_ID=$(oci network private-ip list \
             --subnet-id ${{ steps.subnet.outputs.id }} \
             --ip-address "10.0.1.10" \
@@ -277,7 +280,7 @@ jobs:
           else
             oci network public-ip update \
               --public-ip-id $PIP_ID \
-              --private-ip-id $PRIVATE_IP_ID || true
+              --private-ip-id $PRIVATE_IP_ID
             IP=$(oci network public-ip get \
               --public-ip-id $PIP_ID \
               --query 'data.ip-address' --raw-output)
