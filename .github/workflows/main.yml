@@ -17,6 +17,8 @@ env:
   SUBDOMAIN: openhands
   DOMAIN: streamline.it.com
   VM_NAME: instance-2-vm
+  CF_ACCOUNT_ID: 7afc5c5ae6d25a679125939bf9b7b434
+  CF_ZONE_ID: e578aed8f08231dee4e84d3759b38727
   OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: true
   SUPPRESS_LABEL_WARNING: true
 
@@ -63,7 +65,7 @@ jobs:
               --compartment-id $COMPARTMENT_OCID \
               --cidr-block "10.0.0.0/16" \
               --display-name "$NAME" \
-              --dns-label "$(echo instance-2 | tr '-' 'x')vcn" \
+              --dns-label "instance2vcn" \
               --wait-for-state AVAILABLE \
               --query 'data.id' --raw-output)
             echo "Created VCN: $ID"
@@ -138,7 +140,7 @@ jobs:
               --wait-for-state AVAILABLE \
               --query 'data.id' --raw-output)
             oci network nsg rules add --nsg-id $ID --security-rules '[{"direction":"INGRESS","protocol":"6","source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","tcpOptions":{"destinationPortRange":{"min":22,"max":22}}},{"direction":"EGRESS","protocol":"all","destination":"0.0.0.0/0","destinationType":"CIDR_BLOCK"}]'
-            echo "Created NSG with SSH + egress rules: $ID"
+            echo "Created NSG: $ID"
           else
             echo "NSG exists, skipping: $ID"
           fi
@@ -165,7 +167,7 @@ jobs:
               --availability-domain "$AD" \
               --cidr-block "10.0.1.0/24" \
               --display-name "$NAME" \
-              --dns-label "$(echo instance-2 | tr '-' 'x')sub" \
+              --dns-label "instance2sub" \
               --route-table-id ${{ steps.rt.outputs.id }} \
               --wait-for-state AVAILABLE \
               --query 'data.id' --raw-output)
@@ -243,7 +245,6 @@ jobs:
       - name: Assign Reserved Public IP
         id: public_ip
         run: |
-          # Wait for VNIC to be attached
           for i in $(seq 1 10); do
             VNIC_ID=$(oci compute instance list-vnics \
               --instance-id ${{ steps.instance.outputs.id }} \
@@ -254,7 +255,7 @@ jobs:
           done
           echo "VNIC: $VNIC_ID"
 
-          # Use --subnet-id + --ip-address (--vnic-id filter removed in oci_cli 3.x)
+          # --vnic-id filter removed in oci_cli 3.x; use --subnet-id + --ip-address
           PRIVATE_IP_ID=$(oci network private-ip list \
             --subnet-id ${{ steps.subnet.outputs.id }} \
             --ip-address "10.0.1.10" \
@@ -293,8 +294,6 @@ jobs:
         id: cf_tunnel
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
         run: |
           TUNNEL=$(curl -s -X GET \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel?name=openhands-tunnel&is_deleted=false" \
@@ -319,14 +318,12 @@ jobs:
             echo "Tunnel exists: $TUNNEL_ID"
           fi
 
-          # Configure tunnel ingress
           curl -s -X PUT \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations" \
             -H "Authorization: Bearer $CF_API_TOKEN" \
             -H "Content-Type: application/json" \
             --data "{\"config\":{\"ingress\":[{\"hostname\":\"${SUBDOMAIN}.${DOMAIN}\",\"service\":\"http://localhost:3000\"},{\"service\":\"http_status:404\"}]}}"
 
-          # Upsert CNAME DNS record
           CNAME_TARGET="${TUNNEL_ID}.cfargotunnel.com"
           RECORD_ID=$(curl -s \
             "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?name=${SUBDOMAIN}.${DOMAIN}&type=CNAME" \
