@@ -14,11 +14,7 @@ env:
   COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
   INSTANCE_SHAPE: VM.Standard.A1.Flex
   IMAGE_OCID: ocid1.image.oc1.us-chicago-1.aaaaaaaasrbvw2qh25ewu3gg2div6bkwvqdi2oilwxirhic3qa5tzzxrcdwa
-  SUBDOMAIN: openhands
-  DOMAIN: streamline.it.com
   VM_NAME: instance-2-vm
-  CF_ACCOUNT_ID: 7afc5c5ae6d25a679125939bf9b7b434
-  CF_ZONE_ID: e578aed8f08231dee4e84d3759b38727
   OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: true
   SUPPRESS_LABEL_WARNING: true
 
@@ -289,94 +285,7 @@ jobs:
           fi
           echo "ip=$IP" >> $GITHUB_OUTPUT
 
-      # ── Cloudflare Tunnel ──────────────────────────────────────────
-      - name: Create Cloudflare Tunnel and DNS
-        id: cf_tunnel
-        env:
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-        run: |
-          TUNNEL=$(curl -s -X GET \
-            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel?name=openhands-tunnel&is_deleted=false" \
-            -H "Authorization: Bearer $CF_API_TOKEN" \
-            -H "Content-Type: application/json")
-          TUNNEL_ID=$(echo $TUNNEL | jq -r '.result[0].id // empty')
-
-          if [ -z "$TUNNEL_ID" ]; then
-            TUNNEL_SECRET=$(openssl rand -base64 32)
-            RESULT=$(curl -s -X POST \
-              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel" \
-              -H "Authorization: Bearer $CF_API_TOKEN" \
-              -H "Content-Type: application/json" \
-              --data "{\"name\":\"openhands-tunnel\",\"tunnel_secret\":\"$TUNNEL_SECRET\"}")
-            TUNNEL_ID=$(echo $RESULT | jq -r '.result.id')
-            TUNNEL_TOKEN=$(echo $RESULT | jq -r '.result.token')
-            echo "Created tunnel: $TUNNEL_ID"
-          else
-            TUNNEL_TOKEN=$(curl -s -X GET \
-              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/token" \
-              -H "Authorization: Bearer $CF_API_TOKEN" | jq -r '.result')
-            echo "Tunnel exists: $TUNNEL_ID"
-          fi
-
-          curl -s -X PUT \
-            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations" \
-            -H "Authorization: Bearer $CF_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            --data "{\"config\":{\"ingress\":[{\"hostname\":\"${SUBDOMAIN}.${DOMAIN}\",\"service\":\"http://localhost:3000\"},{\"service\":\"http_status:404\"}]}}"
-
-          CNAME_TARGET="${TUNNEL_ID}.cfargotunnel.com"
-          RECORD_ID=$(curl -s \
-            "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?name=${SUBDOMAIN}.${DOMAIN}&type=CNAME" \
-            -H "Authorization: Bearer $CF_API_TOKEN" | jq -r '.result[0].id // empty')
-
-          if [ -z "$RECORD_ID" ]; then
-            curl -s -X POST \
-              "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records" \
-              -H "Authorization: Bearer $CF_API_TOKEN" \
-              -H "Content-Type: application/json" \
-              --data "{\"type\":\"CNAME\",\"name\":\"${SUBDOMAIN}\",\"content\":\"${CNAME_TARGET}\",\"proxied\":true,\"ttl\":1}"
-            echo "Created DNS CNAME: ${SUBDOMAIN}.${DOMAIN} -> $CNAME_TARGET"
-          else
-            curl -s -X PATCH \
-              "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$RECORD_ID" \
-              -H "Authorization: Bearer $CF_API_TOKEN" \
-              -H "Content-Type: application/json" \
-              --data "{\"content\":\"${CNAME_TARGET}\"}"
-            echo "Updated DNS CNAME: ${SUBDOMAIN}.${DOMAIN} -> $CNAME_TARGET"
-          fi
-
-          echo "tunnel_token=$TUNNEL_TOKEN" >> $GITHUB_OUTPUT
-
-      # ── SSH + Provision ────────────────────────────────────────────
-      - name: Wait for SSH
-        run: |
-          echo "${{ secrets.OCI_SSH_PRIVATE_KEY }}" > /tmp/ssh.key
-          chmod 600 /tmp/ssh.key
-          for i in $(seq 1 30); do
-            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-              -i /tmp/ssh.key opc@${{ steps.public_ip.outputs.ip }} \
-              "echo ready" 2>/dev/null; then
-              echo "SSH is up!"
-              break
-            fi
-            echo "Attempt $i/30 - waiting 20s..."
-            sleep 20
-          done
-
-      - name: Run setup.sh
-        env:
-          TUNNEL_TOKEN: ${{ steps.cf_tunnel.outputs.tunnel_token }}
-        run: |
-          scp -o StrictHostKeyChecking=no -i /tmp/ssh.key \
-            setup.sh opc@${{ steps.public_ip.outputs.ip }}:/tmp/setup.sh
-          ssh -o StrictHostKeyChecking=no -i /tmp/ssh.key \
-            opc@${{ steps.public_ip.outputs.ip }} \
-            "export CLOUDFLARE_TUNNEL_TOKEN='${TUNNEL_TOKEN}' && \
-             chmod +x /tmp/setup.sh && \
-             sudo -E bash /tmp/setup.sh > /tmp/setup.log 2>&1"
-
       - name: Done
         run: |
           echo "✅ VM provisioned successfully"
-          echo "Public IP : ${{ steps.public_ip.outputs.ip }}"
-          echo "OpenHands : https://${{ env.SUBDOMAIN }}.${{ env.DOMAIN }}"
+          echo "Public IP: ${{ steps.public_ip.outputs.ip }}"
