@@ -1,59 +1,385 @@
-name: OCI Infrastructure Deployment
+name: Build OCI VM
+
 on:
-  # Allows manual runs from the GitHub UI
   workflow_dispatch:
+    inputs:
+      rebuild_vm:
+        description: 'Destroy and rebuild the VM instance'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  OCI_REGION: us-chicago-1
+  COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+  INSTANCE_SHAPE: VM.Standard.A1.Flex
+  IMAGE_OCID: ocid1.image.oc1.us-chicago-1.aaaaaaaasrbvw2qh25ewu3gg2div6bkwvqdi2oilwxirhic3qa5tzzxrcdwa
+  SUBDOMAIN: openhands
+  DOMAIN: streamline.it.com
+  VM_NAME: instance-2-vm
+  OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: true
+  SUPPRESS_LABEL_WARNING: true
 
 jobs:
-  terraform:
+  build-vm:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
-    
+
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      # --- SSH PRIVATE KEY HANDLING ---
-      - name: 🔑 Write Private Key to File
-        id: write_key
+      # ── OCI CLI Setup ──────────────────────────────────────────────
+      - name: Install OCI CLI
         run: |
-          # 1. Create the private key file from the secret content
-          echo "${{ secrets.TF_SECRET_OCI_PRIVATE_KEY }}" > oci_api_key.pem
-          # 2. Set necessary permissions for the key
-          chmod 600 oci_api_key.pem
-        
-      # --- TERRAFORM EXECUTION ---
-      - name: Terraform Init and Apply
+          curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh -o install.sh
+          bash install.sh --accept-all-defaults
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Configure OCI CLI
         env:
-          TF_VAR_tenancy_ocid: ocid1.tenancy.oc1..aaaaaaaavocih5w72aex63uv7hngi7wq5wntycvxq6bdyaaiwow3wsge4oza
-          TF_VAR_compartment_ocid: ocid1.tenancy.oc1..aaaaaaaavocih5w72aex63uv7hngi7wq5wntycvxq6bdyaaiwow3wsge4oza
-          TF_VAR_user_ocid: ocid1.user.oc1..aaaaaaaa3pkihtxuik7bgkqq5mlygvvcpfzatub6jewkxtf6hij2lgvvo62q
-          TF_VAR_fingerprint: ea:4d:c0:02:2a:59:53:1e:3f:ef:7f:2b:f7:98:e2:9d
-          TF_VAR_region: us-chicago-1
-          
-          TF_VAR_private_key_path: "./oci_api_key.pem"
-          
-          TF_VAR_cloudflare_api_token: ${{ secrets.TF_SECRET_CLOUDFLARE_API_TOKEN }}
-          TF_VAR_cloudflare_account_id: 7afc5c5ae6d25a679125939bf9b7b434
-          TF_VAR_cloudflare_zone_id: e578aed8f08231dee4e84d3759b38727 
-          
-          TF_VAR_instance_shape: VM.Standard.A1.Flex 
-          TF_VAR_availability_domain_index: 1
-          TF_VAR_ssh_public_key: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCMD27xoPXu6vlkVyHpW+hy3oXmLxYvNIca6RtkFp9PjKW237eX4/J1gMFbddRdPr4K2+LSVvZfaMbn/8iPpHu7jxFEBsq1mlrdt0tW+zzhPco5QFYFF64c9MXnYujtZni1tDyigfmLQzLOmcS6o+iiX5j3ByW8eBUOoiYR3ZcuePMozR9M+7CD4UHJl7oEvhtRmFr+NL2jvLHJfzhy56PWMJO05kNyOdDXLy2wmT8XzLxVjp2C6CWZ0S9PlbjN7pvK9QydC9ldh++A3pWt2Z1f9pNZIQ7Axsw5SBbbC2xjsoJTj1q505sq30XTk/veK5cGDsUJ8frZ9dQoUSsnmGiZ"
-          TF_VAR_domain_name: "streamline.it.com" # Using example
-          TF_VAR_subdomain: "openhands" # Using example
-
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+          OCI_USER: ${{ secrets.OCI_USER }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
         run: |
-          # Initialize Terraform
-          terraform init
-          
-          # Taint the required resources
-          terraform taint null_resource.vm_provisioner || true
-          terraform taint oci_core_instance.always_free_vm || true
-          
-          # Apply the changes
-          terraform apply -auto-approve
+          mkdir -p ~/.oci
+          echo "$OCI_KEY" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          printf '[DEFAULT]\nuser=%s\nfingerprint=%s\ntenancy=%s\nregion=%s\nkey_file=/home/runner/.oci/oci_api_key.pem\n' \
+            "$OCI_USER" "$OCI_FINGERPRINT" "$OCI_TENANCY" "$OCI_REGION" > ~/.oci/config
+          chmod 600 ~/.oci/config
+
+      # ── VCN ────────────────────────────────────────────────────────
+      - name: Create VCN
+        id: vcn
+        run: |
+          NAME="instance-2-vcn"
+          ID=$(oci network vcn list \
+            --compartment-id $COMPARTMENT_OCID \
+            --display-name "$NAME" \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+            ID=$(oci network vcn create \
+              --compartment-id $COMPARTMENT_OCID \
+              --cidr-block "10.0.0.0/16" \
+              --display-name "$NAME" \
+              --dns-label "$(echo instance-2 | tr '-' 'x')vcn" \
+              --wait-for-state AVAILABLE \
+              --query 'data.id' --raw-output)
+            echo "Created VCN: $ID"
+          else
+            echo "VCN exists, skipping: $ID"
+          fi
+          echo "id=$ID" >> $GITHUB_OUTPUT
+
+      # ── Internet Gateway ───────────────────────────────────────────
+      - name: Create Internet Gateway
+        id: igw
+        run: |
+          NAME="instance-2-igw"
+          ID=$(oci network internet-gateway list \
+            --compartment-id $COMPARTMENT_OCID \
+            --vcn-id ${{ steps.vcn.outputs.id }} \
+            --display-name "$NAME" \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+            ID=$(oci network internet-gateway create \
+              --compartment-id $COMPARTMENT_OCID \
+              --vcn-id ${{ steps.vcn.outputs.id }} \
+              --display-name "$NAME" \
+              --is-enabled true \
+              --wait-for-state AVAILABLE \
+              --query 'data.id' --raw-output)
+            echo "Created IGW: $ID"
+          else
+            echo "IGW exists, skipping: $ID"
+          fi
+          echo "id=$ID" >> $GITHUB_OUTPUT
+
+      # ── Route Table ────────────────────────────────────────────────
+      - name: Create Route Table
+        id: rt
+        run: |
+          NAME="instance-2-route-table"
+          ID=$(oci network route-table list \
+            --compartment-id $COMPARTMENT_OCID \
+            --vcn-id ${{ steps.vcn.outputs.id }} \
+            --display-name "$NAME" \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+            ID=$(oci network route-table create \
+              --compartment-id $COMPARTMENT_OCID \
+              --vcn-id ${{ steps.vcn.outputs.id }} \
+              --display-name "$NAME" \
+              --route-rules "[{\"cidrBlock\":\"0.0.0.0/0\",\"networkEntityId\":\"${{ steps.igw.outputs.id }}\"}]" \
+              --wait-for-state AVAILABLE \
+              --query 'data.id' --raw-output)
+            echo "Created route table: $ID"
+          else
+            echo "Route table exists, skipping: $ID"
+          fi
+          echo "id=$ID" >> $GITHUB_OUTPUT
+
+      # ── NSG ────────────────────────────────────────────────────────
+      - name: Create NSG
+        id: nsg
+        run: |
+          NAME="instance-2-nsg"
+          ID=$(oci network nsg list \
+            --compartment-id $COMPARTMENT_OCID \
+            --vcn-id ${{ steps.vcn.outputs.id }} \
+            --display-name "$NAME" \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+            ID=$(oci network nsg create \
+              --compartment-id $COMPARTMENT_OCID \
+              --vcn-id ${{ steps.vcn.outputs.id }} \
+              --display-name "$NAME" \
+              --wait-for-state AVAILABLE \
+              --query 'data.id' --raw-output)
+            oci network nsg rules add --nsg-id $ID --security-rules '[{"direction":"INGRESS","protocol":"6","source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","tcpOptions":{"destinationPortRange":{"min":22,"max":22}}},{"direction":"EGRESS","protocol":"all","destination":"0.0.0.0/0","destinationType":"CIDR_BLOCK"}]'
+            echo "Created NSG with SSH + egress rules: $ID"
+          else
+            echo "NSG exists, skipping: $ID"
+          fi
+          echo "id=$ID" >> $GITHUB_OUTPUT
+
+      # ── Subnet ─────────────────────────────────────────────────────
+      - name: Create Subnet
+        id: subnet
+        run: |
+          AD=$(oci iam availability-domain list \
+            --compartment-id ${{ secrets.OCI_TENANCY }} \
+            --query 'data[1].name' --raw-output)
+          echo "ad=$AD" >> $GITHUB_OUTPUT
+          NAME="instance-2-subnet"
+          ID=$(oci network subnet list \
+            --compartment-id $COMPARTMENT_OCID \
+            --vcn-id ${{ steps.vcn.outputs.id }} \
+            --display-name "$NAME" \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+            ID=$(oci network subnet create \
+              --compartment-id $COMPARTMENT_OCID \
+              --vcn-id ${{ steps.vcn.outputs.id }} \
+              --availability-domain "$AD" \
+              --cidr-block "10.0.1.0/24" \
+              --display-name "$NAME" \
+              --dns-label "$(echo instance-2 | tr '-' 'x')sub" \
+              --route-table-id ${{ steps.rt.outputs.id }} \
+              --wait-for-state AVAILABLE \
+              --query 'data.id' --raw-output)
+            echo "Created subnet: $ID"
+          else
+            echo "Subnet exists, skipping: $ID"
+          fi
+          echo "id=$ID" >> $GITHUB_OUTPUT
+
+      # ── Terminate existing VM (rebuild only) ───────────────────────
+      - name: Terminate existing VM
+        if: ${{ inputs.rebuild_vm == true }}
+        run: |
+          ID=$(oci compute instance list \
+            --compartment-id $COMPARTMENT_OCID \
+            --display-name "$VM_NAME" \
+            --lifecycle-state RUNNING \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+            echo "Terminating $ID..."
+            oci compute instance terminate \
+              --instance-id $ID \
+              --preserve-boot-volume false \
+              --force \
+              --wait-for-state TERMINATED
+          else
+            echo "No running VM found to terminate."
+          fi
+
+      # ── Launch VM ──────────────────────────────────────────────────
+      - name: Launch VM Instance
+        id: instance
+        env:
+          SSH_PUB: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+        run: |
+          ID=$(oci compute instance list \
+            --compartment-id $COMPARTMENT_OCID \
+            --display-name "$VM_NAME" \
+            --lifecycle-state RUNNING \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+            echo "VM already running: $ID"
+          else
+            echo "$SSH_PUB" > /tmp/ssh_pub.key
+            echo "Launching VM - will retry on capacity errors..."
+            for attempt in $(seq 1 20); do
+              ID=$(oci compute instance launch \
+                --compartment-id $COMPARTMENT_OCID \
+                --availability-domain "qwTa:US-CHICAGO-1-AD-2" \
+                --display-name "$VM_NAME" \
+                --shape $INSTANCE_SHAPE \
+                --shape-config '{"ocpus":1,"memoryInGBs":6}' \
+                --image-id $IMAGE_OCID \
+                --subnet-id ${{ steps.subnet.outputs.id }} \
+                --assign-public-ip false \
+                --private-ip "10.0.1.10" \
+                --nsg-ids "[\"${{ steps.nsg.outputs.id }}\"]" \
+                --ssh-authorized-keys-file /tmp/ssh_pub.key \
+                --boot-volume-size-in-gbs 50 \
+                --freeform-tags "{\"env\":\"instance-2\"}" \
+                --wait-for-state RUNNING \
+                --query 'data.id' --raw-output 2>/dev/null) && break
+              echo "Attempt $attempt/20 failed (likely capacity). Retrying in 30s..."
+              sleep 30
+            done
+            if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+              echo "Failed to launch VM after 20 attempts."
+              exit 1
+            fi
+            echo "Launched VM: $ID"
+          fi
+          echo "id=$ID" >> $GITHUB_OUTPUT
+
+      # ── Assign Reserved Public IP ──────────────────────────────────
+      - name: Assign Reserved Public IP
+        id: public_ip
+        run: |
+          # Wait for VNIC to be attached
+          for i in $(seq 1 10); do
+            VNIC_ID=$(oci compute instance list-vnics \
+              --instance-id ${{ steps.instance.outputs.id }} \
+              --query 'data[0].id' --raw-output 2>/dev/null)
+            [ -n "$VNIC_ID" ] && [ "$VNIC_ID" != "null" ] && break
+            echo "Waiting for VNIC... ($i/10)"
+            sleep 10
+          done
+          echo "VNIC: $VNIC_ID"
+
+          # Use --subnet-id + --ip-address (--vnic-id filter removed in oci_cli 3.x)
+          PRIVATE_IP_ID=$(oci network private-ip list \
+            --subnet-id ${{ steps.subnet.outputs.id }} \
+            --ip-address "10.0.1.10" \
+            --query 'data[0].id' --raw-output)
+          echo "Private IP OCID: $PRIVATE_IP_ID"
+
+          PIP_NAME="instance-2-reserved-ip"
+          PIP_ID=$(oci network public-ip list \
+            --compartment-id $COMPARTMENT_OCID \
+            --scope REGION \
+            --display-name "$PIP_NAME" \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+
+          if [ -z "$PIP_ID" ] || [ "$PIP_ID" = "null" ]; then
+            IP=$(oci network public-ip create \
+              --compartment-id $COMPARTMENT_OCID \
+              --lifetime RESERVED \
+              --display-name "$PIP_NAME" \
+              --private-ip-id $PRIVATE_IP_ID \
+              --wait-for-state ASSIGNED \
+              --query 'data.ip-address' --raw-output)
+            echo "Created and assigned reserved IP: $IP"
+          else
+            oci network public-ip update \
+              --public-ip-id $PIP_ID \
+              --private-ip-id $PRIVATE_IP_ID || true
+            IP=$(oci network public-ip get \
+              --public-ip-id $PIP_ID \
+              --query 'data.ip-address' --raw-output)
+            echo "Re-assigned existing reserved IP: $IP"
+          fi
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+
+      # ── Cloudflare Tunnel ──────────────────────────────────────────
+      - name: Create Cloudflare Tunnel and DNS
+        id: cf_tunnel
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+        run: |
+          TUNNEL=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel?name=openhands-tunnel&is_deleted=false" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json")
+          TUNNEL_ID=$(echo $TUNNEL | jq -r '.result[0].id // empty')
+
+          if [ -z "$TUNNEL_ID" ]; then
+            TUNNEL_SECRET=$(openssl rand -base64 32)
+            RESULT=$(curl -s -X POST \
+              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel" \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data "{\"name\":\"openhands-tunnel\",\"tunnel_secret\":\"$TUNNEL_SECRET\"}")
+            TUNNEL_ID=$(echo $RESULT | jq -r '.result.id')
+            TUNNEL_TOKEN=$(echo $RESULT | jq -r '.result.token')
+            echo "Created tunnel: $TUNNEL_ID"
+          else
+            TUNNEL_TOKEN=$(curl -s -X GET \
+              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/token" \
+              -H "Authorization: Bearer $CF_API_TOKEN" | jq -r '.result')
+            echo "Tunnel exists: $TUNNEL_ID"
+          fi
+
+          # Configure tunnel ingress
+          curl -s -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "{\"config\":{\"ingress\":[{\"hostname\":\"${SUBDOMAIN}.${DOMAIN}\",\"service\":\"http://localhost:3000\"},{\"service\":\"http_status:404\"}]}}"
+
+          # Upsert CNAME DNS record
+          CNAME_TARGET="${TUNNEL_ID}.cfargotunnel.com"
+          RECORD_ID=$(curl -s \
+            "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?name=${SUBDOMAIN}.${DOMAIN}&type=CNAME" \
+            -H "Authorization: Bearer $CF_API_TOKEN" | jq -r '.result[0].id // empty')
+
+          if [ -z "$RECORD_ID" ]; then
+            curl -s -X POST \
+              "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records" \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data "{\"type\":\"CNAME\",\"name\":\"${SUBDOMAIN}\",\"content\":\"${CNAME_TARGET}\",\"proxied\":true,\"ttl\":1}"
+            echo "Created DNS CNAME: ${SUBDOMAIN}.${DOMAIN} -> $CNAME_TARGET"
+          else
+            curl -s -X PATCH \
+              "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$RECORD_ID" \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data "{\"content\":\"${CNAME_TARGET}\"}"
+            echo "Updated DNS CNAME: ${SUBDOMAIN}.${DOMAIN} -> $CNAME_TARGET"
+          fi
+
+          echo "tunnel_token=$TUNNEL_TOKEN" >> $GITHUB_OUTPUT
+
+      # ── SSH + Provision ────────────────────────────────────────────
+      - name: Wait for SSH
+        run: |
+          echo "${{ secrets.OCI_SSH_PRIVATE_KEY }}" > /tmp/ssh.key
+          chmod 600 /tmp/ssh.key
+          for i in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+              -i /tmp/ssh.key opc@${{ steps.public_ip.outputs.ip }} \
+              "echo ready" 2>/dev/null; then
+              echo "SSH is up!"
+              break
+            fi
+            echo "Attempt $i/30 - waiting 20s..."
+            sleep 20
+          done
+
+      - name: Run setup.sh
+        env:
+          TUNNEL_TOKEN: ${{ steps.cf_tunnel.outputs.tunnel_token }}
+        run: |
+          scp -o StrictHostKeyChecking=no -i /tmp/ssh.key \
+            setup.sh opc@${{ steps.public_ip.outputs.ip }}:/tmp/setup.sh
+          ssh -o StrictHostKeyChecking=no -i /tmp/ssh.key \
+            opc@${{ steps.public_ip.outputs.ip }} \
+            "export CLOUDFLARE_TUNNEL_TOKEN='${TUNNEL_TOKEN}' && \
+             chmod +x /tmp/setup.sh && \
+             sudo -E bash /tmp/setup.sh > /tmp/setup.log 2>&1"
+
+      - name: Done
+        run: |
+          echo "✅ VM provisioned successfully"
+          echo "Public IP : ${{ steps.public_ip.outputs.ip }}"
+          echo "OpenHands : https://${{ env.SUBDOMAIN }}.${{ env.DOMAIN }}"
